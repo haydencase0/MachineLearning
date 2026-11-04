@@ -1,0 +1,482 @@
+---
+title: "Daily Bike Rentals: Neural Network"
+jupyter: python3
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  timeout: 1800
+---
+
+## Load the libraries and data
+
+```{python}
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow import keras
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Input, Dense, Dropout
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import root_mean_squared_error, r2_score
+
+keras.utils.set_random_seed(42)
+
+bikes = pl.read_csv(
+    "https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/bikes.csv"
+).with_columns(pl.col("dteday").str.strptime(pl.Date, "%m/%d/%Y"))
+bikes.head()
+```
+
+## Prepare one row per date
+
+Add casual and registered rentals for the daily target. Average the weather measurements and use the most frequent weather category. 
+
+```{python}
+daily = bikes.group_by("dteday").agg(
+    (pl.col("casual").sum() + pl.col("registered").sum()).alias("rentals"),
+    pl.col("temp_c", "feels_like_c", "hum", "windspeed").mean(),
+    pl.col("weathersit").mode().min(),
+    pl.col("season", "holiday", "workingday").first(),
+).sort("dteday")
+
+daily = daily.with_columns(
+    pl.col("dteday").dt.year().alias("year"),
+    pl.col("dteday").dt.month().alias("month"),
+    pl.col("dteday").dt.weekday().alias("weekday"),
+)
+
+X = daily.drop("dteday", "rentals").to_dummies(
+    columns=["year", "month", "weekday", "season", "weathersit"]
+)
+y = daily["rentals"].to_numpy().astype(np.float32)
+daily
+```
+
+## Split the data
+
+Use 70% of dates for training, 15% for validation, and 15% for testing. This random split measures performance on held-out historical dates.
+
+```{python}
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.30, random_state=42
+)
+X_validation, X_test, y_validation, y_test = train_test_split(
+    X_test, y_test, test_size=0.50, random_state=42
+)
+```
+
+## Data correlation
+
+Compare the weather measurements, calendar indicators, and daily rentals using training data. Values near 1 or -1 indicate a strong linear relationship; values near 0 indicate a weak linear relationship. Compare validation results before removing correlated inputs.
+
+```{python}
+correlation_data = X_train.select(
+    "temp_c", "feels_like_c", "hum", "windspeed", "holiday", "workingday"
+).with_columns(pl.Series("rentals", y_train))
+correlation = correlation_data.to_pandas().corr()
+
+plt.figure(figsize=(9, 7))
+sns.heatmap(correlation, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1)
+plt.title("Training-data correlations")
+plt.tight_layout()
+plt.show()
+```
+
+## Select the temperature feature
+
+**Johnny, Data Science Intern:** Looking at the features we have, how do you think we should handle the temperature features?
+
+Use `feels_like_c` as the model's temperature input. Both temperatures remain in the correlation graph above for comparison. Validation results will show whether this choice improves prediction error.
+
+```{python}
+# Use the same input columns for training, validation, testing, and recovery plots.
+X = X.drop("temp_c")
+X_train = X_train.drop("temp_c")
+X_validation = X_validation.drop("temp_c")
+X_test = X_test.drop("temp_c")
+```
+
+## Scale the data
+
+Fit the scaler on training data and reuse it for validation and testing.
+
+```{python}
+norm = MinMaxScaler().fit(X_train)
+X_train = norm.transform(X_train)
+X_validation = norm.transform(X_validation)
+X_test = norm.transform(X_test)
+```
+
+## Compare model settings
+
+**Johnny, Data Science Intern:** What are you planning to use for the loss function?
+
+Start with mean squared error (MSE), which gives larger rental-count errors more weight. The experiment also tests mean absolute error (MAE). All trials use validation MSE for early stopping and validation RMSE for model selection, so the losses are compared using the same evaluation measure. The final model uses the loss from the selected trial.
+
+Keep the same training, validation, and test dates for every trial. Change one aspect of the current settings at a time. Early stopping restores the best validation weights, and the lowest validation RMSE selects the model. The test dates are evaluated after this selection.
+
+```{python}
+#| label: hyperparameter-comparison
+# Start with the current model, then test small changes.
+defaults = {
+    "learning_rate": 0.001, "hidden_layers": [128, 256, 64],
+    "batch_size": 32, "activation": "relu", "optimizer": "Adam",
+    "loss": "mean_squared_error",
+}
+experiments = [
+    ("Current settings", "Baseline", {}),
+    ("Learning rate 0.0003", "Learning rate (B)", {"learning_rate": 0.0003}),
+    ("Learning rate 0.003", "Learning rate (B)", {"learning_rate": 0.003}),
+    ("Two hidden layers: 128, 64", "Network size (A)", {"hidden_layers": [128, 64]}),
+    ("Batch size 64", "Batch size (C)", {"batch_size": 64}),
+    ("ELU activation", "Activation (D)", {"activation": "elu"}),
+    ("RMSprop optimizer", "Optimizer (B)", {"optimizer": "RMSprop"}),
+    ("Mean absolute error loss", "Loss function (D)", {"loss": "mean_absolute_error"}),
+]
+
+trial_results = []
+best_validation_rmse = float("inf")
+for name, aspect, changes in experiments:
+    keras.backend.clear_session()
+    keras.utils.set_random_seed(42)
+    settings = {**defaults, **changes}
+    print(f"Training: {name}", flush=True)
+
+    trial_model = Sequential([Input(shape=(X_train.shape[1],))])
+    for layer_number, neurons in enumerate(settings["hidden_layers"]):
+        trial_model.add(Dense(neurons, activation=settings["activation"]))
+        if layer_number == 0:
+            trial_model.add(Dropout(0.2))
+    trial_model.add(Dense(1))
+
+    optimizer_class = {"Adam": keras.optimizers.Adam, "RMSprop": keras.optimizers.RMSprop}
+    trial_model.compile(
+        optimizer=optimizer_class[settings["optimizer"]](learning_rate=settings["learning_rate"]),
+        loss=settings["loss"], metrics=["mse"],
+    )
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor="val_mse", patience=30, restore_best_weights=True
+    )
+    trial_history = trial_model.fit(
+        X_train, y_train,
+        validation_data=(X_validation, y_validation),
+        epochs=500, batch_size=settings["batch_size"],
+        callbacks=[early_stop], verbose=0,
+    )
+    validation_predictions = np.clip(
+        trial_model.predict(X_validation, verbose=0).ravel(), 0, None
+    )
+    validation_rmse = float(root_mean_squared_error(y_validation, validation_predictions))
+    trial_results.append({
+        "experiment": name, "aspect": aspect,
+        "learning_rate": settings["learning_rate"],
+        "validation_rmse": validation_rmse,
+        "validation_r2": float(r2_score(y_validation, validation_predictions)),
+        "best_epoch": int(np.argmin(trial_history.history["val_mse"])) + 1,
+        "epochs_trained": len(trial_history.history["loss"]),
+    })
+    print(f"Validation RMSE: {validation_rmse:,.2f}", flush=True)
+    if validation_rmse < best_validation_rmse:
+        best_validation_rmse = validation_rmse
+        model, history = trial_model, trial_history
+        best_experiment = name
+
+comparison = pl.DataFrame(trial_results).sort("validation_rmse")
+print(f"Selected using validation data: {best_experiment}")
+comparison.select(
+    "experiment", "validation_rmse", "validation_r2", "best_epoch", "epochs_trained"
+).with_columns(pl.col("validation_rmse").round(2), pl.col("validation_r2").round(4))
+```
+
+The table compares these settings under a 500-epoch limit and one fixed random seed. A trial that reaches that limit may need more training. These experiments identify the best setting tested here; they do not establish a globally optimal configuration.
+
+## Plot training and validation error
+
+```{python}
+plt.plot(history.history["mse"], label="Training error")
+plt.plot(history.history["val_mse"], label="Validation error")
+plt.xlabel("Epoch")
+plt.ylabel("Mean squared error")
+plt.legend()
+plt.show()
+```
+
+## Predict and evaluate
+
+**Johnny, Data Science Intern:** How will we know if our model has strong predictive power?
+
+```{python}
+predictions = np.clip(model.predict(X_test, verbose=0).ravel(), 0, None)
+
+print(f"RMSE: {root_mean_squared_error(y_test, predictions):,.2f} rentals per day")
+print(f"R2: {r2_score(y_test, predictions):.4f}")
+
+results = pl.DataFrame({"actual": y_test, "predictions": predictions}).with_columns(
+    (pl.col("actual") - pl.col("predictions")).alias("difference")
+)
+results.head(10)
+```
+
+```{python}
+plt.scatter(y_test, predictions, alpha=0.4)
+plt.plot([0, y_test.max()], [0, y_test.max()], "r--")
+plt.xlabel("Actual daily rentals")
+plt.ylabel("Predicted daily rentals")
+plt.show()
+```
+
+## Questions from stakeholders
+Zhao, CEO of WelcomeBike:
+If you run your model on the data and the results seem lower than you expected, which of the following hyperparameters do you feel has the most potential for model improvement?
+A. Number of neurons and number of hidden layers.
+B. Learning rate and optimizer selection.
+C. Batch size and number of epochs.
+D. Activation functions of the layers and overall loss function.
+
+What approach do you think you're going to take to find the optimal learning rate?
+
+**Model-improvement experiment:** The comparison above tests options A through D using validation data. Learning rate and optimizer selection (B) are useful first candidates to investigate; the table shows whether they helped relative to the current settings. The selected trial supplies the learning curve and final test results above.
+
+**Learning-rate approach:** Compare Adam learning rates of 0.0003, 0.001, and 0.003 while holding the network, batch size, activation, and loss fixed. Select the best tested rate using validation RMSE. MSE and RMSE measure errors in squared rentals and rentals per day respectively; R2 provides a second view of predictive performance.
+
+```{python}
+#| label: zhao-learning-rate-results
+learning_rates = comparison.filter(
+    pl.col("aspect").is_in(["Baseline", "Learning rate (B)"])
+).sort("learning_rate")
+baseline_rmse = comparison.filter(pl.col("aspect") == "Baseline")["validation_rmse"][0]
+best_rate = learning_rates.sort("validation_rmse").row(0, named=True)
+best_trial = comparison.row(0, named=True)
+print(f"Best tested Adam learning rate: {best_rate['learning_rate']}")
+print(f"Best overall trial: {best_trial['experiment']}")
+print(f"Validation RMSE: {best_trial['validation_rmse']:,.2f} rentals per day")
+print(f"Reduction from current settings: {100 * (baseline_rmse - best_trial['validation_rmse']) / baseline_rmse:.2f}%")
+learning_rates.select(
+    "learning_rate", "validation_rmse", "validation_r2", "epochs_trained"
+).with_columns(pl.col("validation_rmse").round(2), pl.col("validation_r2").round(4))
+```
+
+```{python}
+#| label: zhao-learning-rate-plot
+plt.semilogx(learning_rates["learning_rate"], learning_rates["validation_rmse"], "o-")
+plt.xticks(learning_rates["learning_rate"].to_list(), ["0.0003", "0.001", "0.003"])
+plt.xlabel("Adam learning rate")
+plt.ylabel("Validation RMSE (rentals per day)")
+plt.title("Choosing a learning rate using validation data")
+plt.tight_layout()
+plt.show()
+```
+
+
+Coming out of the pandemic has put a strain on resources. Our customers are much more concerned about health and safety of sharing bikes.
+In your executive summary, would you add your recommendations for when we could pull bikes out of rotation to clean and disinfect them? For example, what days and times we should bring them in?
+We also need to know if we have any lasting problems now that we are a few years past COVID-19. What can we expect for forcasts into the future? Are we back on track or still recovering?
+
+### Cleaning schedule: days and hours
+
+```{python}
+#| label: cleaning-schedule
+from datetime import timedelta
+
+# Exclude the final month if its last date has not been observed.
+last_date = bikes["dteday"].max()
+end_date = daily.select(
+    pl.col("dteday").max().dt.truncate("1mo").dt.offset_by("1mo")
+).item()
+if last_date != end_date - timedelta(days=1):
+    end_date = last_date.replace(day=1)
+start_date = pl.Series([end_date]).dt.offset_by("-1y")[0]
+
+hourly_demand = (
+    bikes.filter((pl.col("dteday") >= start_date) & (pl.col("dteday") < end_date))
+    .with_columns(
+        pl.col("dteday").dt.weekday().alias("weekday"),
+        pl.col("hr").cast(pl.Int64).alias("hour"),
+        (pl.col("casual") + pl.col("registered")).alias("rentals"),
+    )
+    .group_by("weekday", "hour").agg(pl.col("rentals").mean())
+)
+heatmap = hourly_demand.pivot(on="hour", index="weekday", values="rentals").sort("weekday")
+
+plt.figure(figsize=(13, 4))
+sns.heatmap(
+    heatmap.select([str(hour) for hour in range(24)]).to_numpy(),
+    cmap="YlOrRd", xticklabels=range(24),
+    yticklabels=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    cbar_kws={"label": "Average rentals per hour"},
+)
+plt.xlabel("Hour of day (0-23)")
+plt.ylabel("Day of week")
+plt.title(f"Cleaning windows: {start_date:%b %Y} to {end_date - timedelta(days=1):%b %Y}")
+plt.tight_layout()
+plt.show()
+```
+
+### Rental-demand recovery compared with 2019
+
+```{python}
+#| label: covid-recovery
+# Reuse the trained winner and the same fitted scaler from the model section.
+fitted_rentals = np.clip(model.predict(norm.transform(X), verbose=0).ravel(), 0, None)
+monthly = (
+    daily.with_columns(pl.Series("model_rentals", fitted_rentals))
+    .filter(pl.col("dteday") < end_date)
+    .with_columns(pl.col("dteday").dt.truncate("1mo").alias("month_start"))
+    .group_by("month_start")
+    .agg(pl.col("rentals", "model_rentals").mean())
+    .with_columns(
+        pl.col("month_start").dt.year().alias("year"),
+        pl.col("month_start").dt.month().alias("month"),
+    )
+)
+baseline_2019 = monthly.filter(pl.col("year") == 2019).select(
+    "month", pl.col("rentals").alias("baseline_rentals")
+)
+recovery = (
+    monthly.filter(pl.col("year") >= 2019)
+    .join(baseline_2019, on="month")
+    .with_columns(
+        (100 * pl.col("rentals") / pl.col("baseline_rentals")).alias("actual_percent"),
+        (100 * pl.col("model_rentals") / pl.col("baseline_rentals")).alias("model_percent"),
+    ).sort("month_start")
+)
+
+plt.figure(figsize=(11, 4))
+plt.plot(recovery["month_start"], recovery["actual_percent"], label="Observed rentals")
+plt.plot(recovery["month_start"], recovery["model_percent"], "--", label="Model fit (historical dates)")
+plt.axhline(100, color="gray", linestyle=":", label="2019 baseline")
+plt.xlabel("Month")
+plt.ylabel("Rentals as % of the same month in 2019")
+plt.title("Rental-demand recovery")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+
+## Predict rentals for each hour in the new dataset
+
+```{python}
+#| label: prepare-hourly-predictions
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+
+december = pl.read_csv(
+    "https://raw.githubusercontent.com/byui-cse/cse450-course/master/data/bikes_december.csv"
+).with_columns(pl.col("dteday").str.strptime(pl.Date, "%m/%d/%Y"))
+
+# Only use labeled observations before the requested prediction dates.
+hourly_history = bikes.filter(pl.col("dteday") < december["dteday"].min())
+
+def hourly_features(data):
+    return data.select(
+        "feels_like_c", "hum", "windspeed", "holiday", "workingday",
+        pl.col("hr").cast(pl.Int64),
+        "season", "weathersit",
+        pl.col("dteday").dt.year().alias("year"),
+        pl.col("dteday").dt.month().alias("month"),
+        pl.col("dteday").dt.weekday().alias("weekday"),
+    ).to_pandas()
+
+hourly_inputs = hourly_features(hourly_history)
+forecast_inputs = hourly_features(december)
+# Scaling the target to thousands of rentals makes network training easier.
+hourly_targets = (
+    hourly_history["casual"] + hourly_history["registered"]
+).to_numpy().astype(np.float32) / 1000
+
+hourly_cutoff = hourly_history.select(
+    pl.col("dteday").max().dt.offset_by("-2mo")
+).item()
+hourly_train_mask = (hourly_history["dteday"] < hourly_cutoff).to_numpy()
+
+hourly_preprocessor = ColumnTransformer([
+    ("numeric", MinMaxScaler(),
+     ["feels_like_c", "hum", "windspeed", "holiday", "workingday", "year"]),
+    ("categorical", OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+     ["hr", "season", "weathersit", "month", "weekday"]),
+])
+hourly_train = hourly_preprocessor.fit_transform(
+    hourly_inputs.loc[hourly_train_mask]
+).astype(np.float32)
+hourly_validation = hourly_preprocessor.transform(
+    hourly_inputs.loc[~hourly_train_mask]
+).astype(np.float32)
+december
+```
+
+```{python}
+#| label: train-hourly-network
+def build_hourly_model(number_of_inputs):
+    keras.utils.set_random_seed(42)
+    network = Sequential([
+        Input(shape=(number_of_inputs,)),
+        Dense(128, activation="relu"),
+        Dropout(0.2),
+        Dense(256, activation="relu"),
+        Dense(64, activation="relu"),
+        Dense(1),
+    ])
+    network.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss="mean_squared_error",
+    )
+    return network
+
+hourly_model = build_hourly_model(hourly_train.shape[1])
+print("Training the hourly model with chronological validation...", flush=True)
+hourly_history_fit = hourly_model.fit(
+    hourly_train, hourly_targets[hourly_train_mask],
+    validation_data=(hourly_validation, hourly_targets[~hourly_train_mask]),
+    epochs=150, batch_size=256, verbose=0,
+    callbacks=[keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=10, restore_best_weights=True
+    )],
+)
+hourly_epochs = int(np.argmin(hourly_history_fit.history["val_loss"])) + 1
+hourly_validation_predictions = np.clip(
+    hourly_model.predict(hourly_validation, verbose=0).ravel() * 1000, 0, None
+)
+hourly_validation_actual = hourly_targets[~hourly_train_mask] * 1000
+print(f"Hourly validation dates: {hourly_cutoff} to {hourly_history['dteday'].max()}")
+print(f"Selected epochs: {hourly_epochs}")
+print(f"Hourly validation RMSE: {root_mean_squared_error(hourly_validation_actual, hourly_validation_predictions):,.2f}")
+print(f"Hourly validation R2: {r2_score(hourly_validation_actual, hourly_validation_predictions):.4f}")
+```
+
+### Export december predictions
+
+```{python}
+#| label: export-hourly-predictions
+hourly_all = hourly_preprocessor.fit_transform(hourly_inputs).astype(np.float32)
+hourly_forecast = hourly_preprocessor.transform(forecast_inputs).astype(np.float32)
+hourly_model = build_hourly_model(hourly_all.shape[1])
+print("Training on all historical rows before exporting...", flush=True)
+hourly_model.fit(
+    hourly_all, hourly_targets,
+    epochs=hourly_epochs, batch_size=256, verbose=0,
+)
+
+december_predictions = np.clip(
+    hourly_model.predict(hourly_forecast, verbose=0).ravel() * 1000, 0, None
+)
+assert len(december_predictions) == december.height
+assert np.isfinite(december_predictions).all()
+december_predictions = np.rint(december_predictions).astype(np.int64)
+
+prediction_export = pl.DataFrame({"predictions": december_predictions})
+prediction_export.write_csv("bikes_december_predictions.csv")
+print(f"Exported {prediction_export.height:,} hourly predictions to bikes_december_predictions.csv")
+
+december_daily_totals = (
+    december.with_columns(pl.Series("predicted_total_rentals", december_predictions))
+    .group_by("dteday").agg(pl.col("predicted_total_rentals").sum())
+    .sort("dteday")
+)
+december_daily_totals
+```
+
