@@ -117,19 +117,17 @@ X_test = norm.transform(X_test)
 
 Start with mean squared error (MSE), which gives larger rental-count errors more weight. The experiment also tests mean absolute error (MAE). All trials use validation MSE for early stopping and validation RMSE for model selection, so the losses are compared using the same evaluation measure. The final model uses the loss from the selected trial.
 
-Keep the same training, validation, and test dates for every trial. Change one aspect of the current settings at a time. Early stopping restores the best validation weights, and the lowest validation RMSE selects the model. The test dates are evaluated after this selection.
-
 ```{python}
 #| label: hyperparameter-comparison
 # Start with the current model, then test small changes.
 defaults = {
-    "learning_rate": 0.001, "hidden_layers": [128, 256, 64],
+    "learning_rate": 0.0003, "hidden_layers": [128, 256, 64],
     "batch_size": 32, "activation": "relu", "optimizer": "Adam",
     "loss": "mean_squared_error",
 }
 experiments = [
     ("Current settings", "Baseline", {}),
-    ("Learning rate 0.0003", "Learning rate (B)", {"learning_rate": 0.0003}),
+    ("Learning rate 0.001", "Learning rate (B)", {"learning_rate": 0.001}),
     ("Learning rate 0.003", "Learning rate (B)", {"learning_rate": 0.003}),
     ("Two hidden layers: 128, 64", "Network size (A)", {"hidden_layers": [128, 64]}),
     ("Batch size 64", "Batch size (C)", {"batch_size": 64}),
@@ -422,7 +420,7 @@ def build_hourly_model(number_of_inputs):
         Dense(1),
     ])
     network.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=keras.optimizers.Adam(learning_rate=defaults["learning_rate"]),
         loss="mean_squared_error",
     )
     return network
