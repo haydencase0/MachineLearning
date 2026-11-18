@@ -1,0 +1,940 @@
+---
+title: "CNN Image Classification"
+jupyter: python3
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  timeout: 1800
+---
+
+```{python}
+from pathlib import Path, PurePosixPath
+from zipfile import ZipFile
+import json
+import shutil
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import train_test_split
+from tensorflow.keras import callbacks, layers, models, optimizers
+from tensorflow.keras.utils import to_categorical
+
+SEED = 42
+IMAGE_SIZE = (32, 32)
+BATCH_SIZE = 64
+EPOCHS = 30
+DARK_LUMINANCE_THRESHOLD = 0.20
+tf.keras.utils.set_random_seed(SEED)
+
+# Support running from either MachineLearning or its notebooks folder.
+NOTEBOOK_DIR = next(
+    (folder for folder in (Path.cwd(), Path.cwd() / "notebooks")
+     if all((folder / name).is_file()
+            for name in ("training1.zip", "training2.zip"))),
+    None,
+)
+if NOTEBOOK_DIR is None:
+    raise FileNotFoundError(
+        "Place training1.zip and training2.zip beside module5_signs.qmd, "
+        "then run from the MachineLearning or notebooks folder."
+    )
+
+DATA_DIR = NOTEBOOK_DIR / "cnn_training_data"
+BASELINE_DIR = NOTEBOOK_DIR / "cnn_training_output"
+PREVIOUS_MODEL_DIR = BASELINE_DIR / "improved"
+OUTPUT_DIR = BASELINE_DIR / "lighting_enhanced"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+```
+
+## Extract and combine both archives
+
+Each image's parent folder supplies its class label. We preserve the archive
+folders so identical filenames in different classes cannot overwrite each other.
+Existing extracted images with the expected size are reused on subsequent runs.
+Only files listed in the two archives enter the dataset.
+
+```{python}
+records = []
+for archive_name in ("training1.zip", "training2.zip"):
+    with ZipFile(NOTEBOOK_DIR / archive_name) as archive:
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+            relative = PurePosixPath(member.filename)
+            if (
+                len(relative.parts) != 3
+                or relative.parts[0] != Path(archive_name).stem
+                or not relative.parts[1].isdigit()
+                or relative.suffix.lower() != ".jpg"
+                or "\\" in member.filename
+                or ".." in relative.parts
+            ):
+                raise ValueError(f"Unexpected archive entry: {member.filename}")
+
+            destination = DATA_DIR.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if (not destination.is_file()
+                    or destination.stat().st_size != member.file_size):
+                with archive.open(member) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+            # Treat a shared filename prefix as one related-image sequence.
+            sequence = relative.stem.split("_")[0]
+            records.append({
+                "path": str(destination.resolve()),
+                "class_name": relative.parts[1],
+                "group": f"{relative.parts[0]}/{relative.parts[1]}/{sequence}",
+            })
+
+images = pd.DataFrame(records).sort_values("path").reset_index(drop=True)
+class_names = sorted(images["class_name"].unique().tolist())
+class_to_index = {name: index for index, name in enumerate(class_names)}
+images["label"] = images["class_name"].map(class_to_index)
+NUM_CLASSES = len(class_names)
+print(f"Loaded {len(images):,} image paths across {NUM_CLASSES} classes.")
+images.groupby("class_name").size().rename("image_count").to_frame()
+```
+
+## Create training, validation, and test sets
+
+Use approximately 70% of filename sequences for training, 15% for validation,
+and 15% for testing, stratified by class. Filenames such as `00043_00015.jpg`
+suggest a sequence prefix (`00043`) and an image number (`00015`). We assume
+images with the same prefix in the same class and archive are related and keep
+them together to reduce leakage. Exact image percentages can vary because
+sequences can have different lengths. These are internal holdouts from the
+provided archives, not a separate official test dataset.
+
+```{python}
+groups = images[["group", "label"]].drop_duplicates()
+train_groups, holdout_groups = train_test_split(
+    groups, test_size=0.30, stratify=groups["label"], random_state=SEED
+)
+validation_groups, test_groups = train_test_split(
+    holdout_groups, test_size=0.50,
+    stratify=holdout_groups["label"], random_state=SEED
+)
+
+def select_images(selected_groups):
+    return images[images["group"].isin(selected_groups["group"])].reset_index(drop=True)
+
+train_images = select_images(train_groups)
+validation_images = select_images(validation_groups)
+test_images = select_images(test_groups)
+
+assert set(train_images["group"]).isdisjoint(validation_images["group"])
+assert set(train_images["group"]).isdisjoint(test_images["group"])
+assert set(validation_images["group"]).isdisjoint(test_images["group"])
+assert len(train_images) + len(validation_images) + len(test_images) == len(images)
+for frame in (train_images, validation_images, test_images):
+    assert set(frame["label"]) == set(range(NUM_CLASSES))
+
+pd.DataFrame({
+    "split": ["Training", "Validation", "Test"],
+    "images": [len(train_images), len(validation_images), len(test_images)],
+    "sequences": [len(train_groups), len(validation_groups), len(test_groups)],
+})
+```
+
+## Preprocessing and lighting improvements
+
+**Johnny, Data Science Intern:**
+
+The training and test images have three color channels, (Red, Green, and Blue), with pixel values for each channel ranging from 0 to 255.
+
+Do you think we need to do any preprocessing before using the data to train the model?
+
+The image preprocessing and lighting helpers are grouped here. Choose the lighting recipe using validation predictions after training.
+
+### Resize, normalize, and encode labels
+
+Like the guide, scale pixels to the range 0–1 and one-hot encode labels for
+categorical cross-entropy. Load images in batches using `tf.data` instead of
+holding all decoded images in memory. Only the training dataset is shuffled;
+test predictions must stay aligned with the test labels.
+
+```{python}
+def load_image(path, label):
+    image = tf.io.decode_jpeg(tf.io.read_file(path), channels=3)
+    image = tf.image.resize(image, IMAGE_SIZE)
+    image = tf.cast(image, tf.float32) / 255.0
+    return image, label
+
+def preprocess_holdout(image_bytes):
+    image = tf.io.decode_jpeg(image_bytes, channels=3)
+    image = tf.image.resize(image, IMAGE_SIZE)
+    return tf.cast(image, tf.float32) / 255.0
+
+def make_dataset(frame, training=False):
+    labels = to_categorical(frame["label"].to_numpy(), num_classes=NUM_CLASSES)
+    dataset = tf.data.Dataset.from_tensor_slices((frame["path"].to_numpy(), labels))
+    if training:
+        dataset = dataset.shuffle(len(frame), seed=SEED)
+    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+train_ds = make_dataset(train_images, training=True)
+validation_ds = make_dataset(validation_images)
+test_ds = make_dataset(test_images)
+
+sample_images, sample_labels = next(iter(train_ds))
+fig, axes = plt.subplots(2, 4, figsize=(10, 5))
+for index, axis in enumerate(axes.flat):
+    axis.imshow(sample_images[index].numpy())
+    axis.set_title(f"Class {class_names[int(tf.argmax(sample_labels[index]))]}")
+    axis.axis("off")
+plt.tight_layout()
+plt.show()
+```
+
+### Improve lighting for dark images
+
+Some signs are very dark. Compare predictions on original images, gamma-adjusted
+copies, and copies with stronger contrast. Gamma below 1 brightens normalized
+pixels, as described in the [TensorFlow gamma-correction documentation](https://www.tensorflow.org/api_docs/python/tf/image/adjust_gamma).
+Contrast enhancement maps each color channel's 1st to 99th percentile into
+the range 0–1, clipping extreme values. A constant channel keeps its original
+values. This can reveal faint symbols, but also amplify noise or change colors.
+It cannot restore detail lost to blur, clipping, or very low resolution.
+
+For this experiment, a dark image has mean luminance below 0.20 on a 0–1 scale.
+The threshold is a diagnostic definition, not a guarantee of image quality.
+
+```{python}
+def mean_luminance(images):
+    return tf.reduce_mean(tf.image.rgb_to_grayscale(images), axis=(-3, -2, -1))
+
+def stretch_contrast(images):
+    """Stretch the 1st–99th percentiles of each RGB channel; accept HWC or NHWC."""
+    images = tf.convert_to_tensor(images, dtype=tf.float32)
+    unbatched = images.shape.rank == 3
+    batch = images[tf.newaxis, ...] if unbatched else images
+    flat = tf.reshape(batch, (tf.shape(batch)[0], -1, 3))
+    ordered = tf.sort(flat, axis=1)
+    pixels = tf.shape(flat)[1]
+    low_index = tf.cast(0.01 * tf.cast(pixels - 1, tf.float32), tf.int32)
+    high_index = tf.cast(0.99 * tf.cast(pixels - 1, tf.float32), tf.int32)
+    low = tf.gather(ordered, low_index, axis=1)[:, tf.newaxis, tf.newaxis, :]
+    high = tf.gather(ordered, high_index, axis=1)[:, tf.newaxis, tf.newaxis, :]
+    span = high - low
+    adjusted = tf.clip_by_value((batch - low) / tf.maximum(span, 1e-6), 0, 1)
+    adjusted = tf.where(span > 1e-6, adjusted, batch)
+    return adjusted[0] if unbatched else adjusted
+
+def adjust_lighting(images, variant):
+    if variant in ("dark_contrast", "dark_contrast_gamma_0.7"):
+        adjusted = stretch_contrast(images)
+        if variant == "dark_contrast_gamma_0.7":
+            adjusted = tf.image.adjust_gamma(adjusted, gamma=0.7)
+        dark = mean_luminance(images) < DARK_LUMINANCE_THRESHOLD
+        return tf.where(
+            dark[..., tf.newaxis, tf.newaxis, tf.newaxis],
+            adjusted, tf.image.adjust_gamma(images, gamma=0.5),
+        )
+    if variant == "contrast":
+        return stretch_contrast(images)
+    if variant == "contrast_gamma_0.7":
+        return tf.image.adjust_gamma(stretch_contrast(images), gamma=0.7)
+    return tf.image.adjust_gamma(images, gamma=float(variant))
+
+def predict_with_lighting(cnn, inputs, variants=(1.0,)):
+    """Average class probabilities over the chosen lighting variations."""
+    if not variants:
+        raise ValueError("At least one lighting variant is required.")
+    if isinstance(inputs, tf.data.Dataset) and isinstance(inputs.element_spec, tuple):
+        image_inputs = inputs.map(lambda images, labels: images)
+    else:
+        image_inputs = inputs
+    predictions = []
+    for variant in variants:
+        if isinstance(image_inputs, tf.data.Dataset):
+            adjusted_inputs = image_inputs
+            if variant != 1.0:
+                adjusted_inputs = image_inputs.map(
+                    lambda images: adjust_lighting(images, variant),
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                )
+        else:
+            adjusted_inputs = adjust_lighting(image_inputs, variant)
+        predictions.append(cnn.predict(adjusted_inputs, verbose=0))
+    return np.mean(predictions, axis=0)
+```
+
+## Data augmentation
+
+**Emma, CEO of GehirnWagen:**
+
+I'm concerned that the model will only be able to recognize signs that look exactly like the ones we have images for.
+
+I understand from Johnny that data augmentation can help with this problem. What strategy would you suggest?
+
+Small rotations, translations, zoom changes, and contrast changes create
+additional training variations. Do not flip traffic signs: a mirrored sign can
+have a different meaning. Keras applies these augmentation layers during
+training and disables them during prediction.
+These follow the techniques
+in the [TensorFlow image-classification tutorial](https://www.tensorflow.org/tutorials/images/classification).
+
+```{python}
+data_augmentation = models.Sequential([
+    layers.RandomRotation(0.025, seed=SEED),
+    layers.RandomTranslation(0.05, 0.05, seed=SEED + 1),
+    layers.RandomZoom(0.10, seed=SEED + 2),
+    layers.RandomContrast(0.15, value_range=(0, 1), seed=SEED + 3),
+], name="training_augmentation")
+```
+
+## Train a CNN that handles more variation
+
+Use the augmentation pipeline as the first model stage. Dropout helps reduce overfitting.
+
+Class weights are computed using training labels only. They give images from
+smaller classes more influence on the training loss. Validation and test sets
+keep their original class distributions. Early stopping restores the weights
+with the lowest validation loss, and the learning rate decreases when that loss
+stalls. If the earlier saved model has matching class labels and weight shapes,
+reuse its learned weights and fine-tune at a lower learning rate. Otherwise,
+train from scratch. Increasing the epoch limit alone does not guarantee better
+predictions.
+
+```{python}
+model = models.Sequential([
+    layers.Input(shape=(*IMAGE_SIZE, 3)),
+    data_augmentation,
+    layers.Conv2D(32, (3, 3), activation="relu"),
+    layers.MaxPooling2D((2, 2)),
+    layers.Conv2D(64, (3, 3), activation="relu"),
+    layers.MaxPooling2D((2, 2)),
+    layers.Flatten(),
+    layers.Dense(64, activation="relu"),
+    layers.Dropout(0.20),
+    layers.Dense(NUM_CLASSES, activation="softmax"),
+])
+
+starting_learning_rate = 0.001
+initial_model_path = BASELINE_DIR / "cnn_sign_model.keras"
+initial_labels_path = BASELINE_DIR / "class_names.json"
+if initial_model_path.is_file() and initial_labels_path.is_file():
+    initial_class_names = json.loads(initial_labels_path.read_text(encoding="utf-8"))
+    initial_model = models.load_model(initial_model_path, compile=False)
+    initial_weights = initial_model.get_weights()
+    expected_weights = model.get_weights()
+    weights_match = (
+        len(initial_weights) == len(expected_weights)
+        and all(old.shape == new.shape
+                for old, new in zip(initial_weights, expected_weights))
+    )
+    if initial_class_names == class_names and weights_match:
+        model.set_weights(initial_weights)
+        starting_learning_rate = 0.0001
+        print("Fine-tuning the earlier saved CNN with learning rate 0.0001.")
+    else:
+        print("Earlier model is incompatible; training from scratch.")
+else:
+    print("No earlier saved CNN found; training from scratch.")
+
+model.compile(
+    optimizer=optimizers.Adam(learning_rate=starting_learning_rate),
+    loss="categorical_crossentropy", metrics=["accuracy"],
+)
+model.summary()
+
+training_class_counts = train_images["label"].value_counts()
+class_weights = {
+    int(label): float(len(train_images) / (NUM_CLASSES * count))
+    for label, count in training_class_counts.items()
+}
+training_callbacks = [
+    callbacks.EarlyStopping(
+        monitor="val_loss", patience=8, restore_best_weights=True, verbose=1,
+    ),
+    callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=1,
+    ),
+    callbacks.CSVLogger(str(OUTPUT_DIR / "training_history.csv")),
+]
+history = model.fit(
+    train_ds,
+    epochs=EPOCHS,
+    validation_data=validation_ds,
+    class_weight=class_weights,
+    callbacks=training_callbacks,
+    shuffle=False,  # train_ds already shuffles the image paths.
+    verbose=2,
+)
+```
+
+## Check whether the weaker classes improve
+
+Compare models on the same labeled validation images. Macro F1 gives each
+class equal importance, so a large class cannot hide weak performance on a
+small class. The per-class table below is sorted by recall, showing the classes
+whose images are missed most often. Use these validation results to choose
+changes; evaluate the selected model on the internal test set afterward.
+The unlabeled holdout archive cannot measure accuracy.
+
+Apply the new contrast correction only to dark images. Brighter images retain
+the previous original-plus-gamma-0.5 average. This avoids changing their input
+contrast unnecessarily. Select the recipe with the highest dark-image validation
+accuracy, provided its overall validation accuracy and macro F1 are at least as
+good as the previous recipe. Break ties with overall macro F1 and accuracy.
+Thus brighter-looking images or higher prediction probabilities alone cannot
+justify replacing the previous recipe. The selected recipe is used consistently
+on test and holdout images; a two-image average costs two prediction passes.
+Manually reviewed holdout examples are not used to choose the recipe.
+
+```{python}
+validation_true = validation_images["label"].to_numpy()
+
+validation_luminance = np.concatenate([
+    mean_luminance(batch).numpy() for batch, labels in validation_ds
+])
+validation_dark = validation_luminance < DARK_LUMINANCE_THRESHOLD
+print(f"Dark validation images: {validation_dark.sum():,} / {len(validation_dark):,}")
+
+def validation_metrics(name, predicted):
+    return {
+        "model": name,
+        "validation_accuracy": accuracy_score(validation_true, predicted),
+        "validation_macro_f1": f1_score(
+            validation_true, predicted, labels=np.arange(NUM_CLASSES),
+            average="macro", zero_division=0,
+        ),
+        "dark_validation_accuracy": (
+            accuracy_score(validation_true[validation_dark], predicted[validation_dark])
+            if validation_dark.any() else np.nan
+        ),
+    }
+
+# Compute each lighting variation once, then compare inexpensive averages.
+validation_by_variant = {
+    variant: predict_with_lighting(model, validation_ds, variants=(variant,))
+    for variant in (1.0, 0.5, 0.7, "contrast", "contrast_gamma_0.7")
+}
+# These are image-wise switches, not averages of two transformations.
+# Reuse cached probabilities to avoid two more full validation passes.
+for targeted, enhanced in (("dark_contrast", "contrast"),
+                          ("dark_contrast_gamma_0.7", "contrast_gamma_0.7")):
+    validation_by_variant[targeted] = np.where(
+        validation_dark[:, np.newaxis],
+        validation_by_variant[enhanced], validation_by_variant[0.5],
+    )
+lighting_recipes = {
+    "Original": (1.0,),
+    "Gamma 0.5": (0.5,),
+    "Gamma 0.7": (0.7,),
+    "Original + gamma 0.5": (1.0, 0.5),
+    "Original + gamma 0.7": (1.0, 0.7),
+    "Original + gamma 0.5 + gamma 0.7": (1.0, 0.5, 0.7),
+    "Contrast only": ("contrast",),
+    "Contrast + gamma 0.7 only": ("contrast_gamma_0.7",),
+    "Original + contrast": (1.0, "contrast"),
+    "Original + contrast + gamma 0.7": (1.0, "contrast_gamma_0.7"),
+    "Original + contrast (dark only)": (1.0, "dark_contrast"),
+    "Original + contrast + gamma 0.7 (dark only)": (1.0, "dark_contrast_gamma_0.7"),
+}
+lighting_rows = []
+for name, variants in lighting_recipes.items():
+    combined = np.mean([validation_by_variant[variant] for variant in variants], axis=0)
+    lighting_rows.append(validation_metrics(name, combined.argmax(axis=1)))
+lighting_comparison = pd.DataFrame(lighting_rows)
+previous_lighting = lighting_comparison[
+    lighting_comparison["model"] == "Original + gamma 0.5"
+].iloc[0]
+lighting_comparison["eligible_for_selection"] = (
+    (lighting_comparison["validation_accuracy"] >= previous_lighting["validation_accuracy"])
+    & (lighting_comparison["validation_macro_f1"] >= previous_lighting["validation_macro_f1"])
+)
+# Full-image contrast variants stay in the diagnostic table, but only targeted
+# corrections or the previous recipe can become the final prediction method.
+lighting_comparison["eligible_for_selection"] &= lighting_comparison["model"].isin([
+    "Original + gamma 0.5",
+    "Original + contrast (dark only)",
+    "Original + contrast + gamma 0.7 (dark only)",
+])
+if validation_dark.any():
+    lighting_comparison["eligible_for_selection"] &= (
+        lighting_comparison["dark_validation_accuracy"]
+        >= previous_lighting["dark_validation_accuracy"]
+    )
+selection_columns = (
+    ["dark_validation_accuracy", "validation_macro_f1", "validation_accuracy"]
+    if validation_dark.any() else ["validation_macro_f1", "validation_accuracy"]
+)
+lighting_comparison = lighting_comparison.sort_values(selection_columns, ascending=False)
+lighting_comparison.to_csv(OUTPUT_DIR / "lighting_comparison.csv", index=False)
+selected_recipe = lighting_comparison[
+    lighting_comparison["eligible_for_selection"]
+].iloc[0]["model"]
+inference_variants = lighting_recipes[selected_recipe]
+print(f"Selected lighting recipe: {selected_recipe}")
+print(lighting_comparison.to_string(index=False))
+validation_probabilities = np.mean(
+    [validation_by_variant[variant] for variant in inference_variants], axis=0,
+)
+validation_predicted = validation_probabilities.argmax(axis=1)
+
+comparison_rows = []
+baseline_class_recalls = None
+baseline_path = BASELINE_DIR / "cnn_sign_model.keras"
+baseline_labels_path = BASELINE_DIR / "class_names.json"
+if baseline_path.is_file() and baseline_labels_path.is_file():
+    baseline_class_names = json.loads(baseline_labels_path.read_text(encoding="utf-8"))
+    if baseline_class_names == class_names:
+        baseline_model = models.load_model(baseline_path, compile=False)
+        baseline_predicted = baseline_model.predict(validation_ds, verbose=0).argmax(axis=1)
+        comparison_rows.append(validation_metrics("Previous saved CNN", baseline_predicted))
+        baseline_class_recalls = np.diag(confusion_matrix(
+            validation_true, baseline_predicted,
+            labels=np.arange(NUM_CLASSES), normalize="true",
+        ))
+    else:
+        print("Previous model has a different class order; comparison skipped.")
+comparison_rows.append(validation_metrics("Augmented, regularized CNN", validation_predicted))
+comparison_rows.append(previous_lighting.to_dict())
+validation_comparison = pd.DataFrame(comparison_rows)
+validation_comparison.to_csv(OUTPUT_DIR / "validation_comparison.csv", index=False)
+print(validation_comparison.to_string(index=False))
+
+validation_report = classification_report(
+    validation_true, validation_predicted, labels=np.arange(NUM_CLASSES),
+    target_names=class_names, output_dict=True, zero_division=0,
+)
+validation_class_report = pd.DataFrame(validation_report).T.loc[class_names]
+if baseline_class_recalls is not None:
+    validation_class_report["previous_recall"] = pd.Series(
+        baseline_class_recalls, index=class_names,
+    )
+    validation_class_report["recall_change"] = (
+        validation_class_report["recall"] - validation_class_report["previous_recall"]
+    )
+validation_class_report = validation_class_report.sort_values("recall")
+validation_class_report.to_csv(OUTPUT_DIR / "validation_class_report.csv", index_label="class")
+validation_class_report
+```
+
+### Inspect confidently wrong validation predictions
+
+These labeled examples show actual mistakes, including mistakes made with high
+model probabilities. Review recurring patterns such as blur, lighting, framing,
+or very similar symbols before changing the augmentation settings. A model
+probability is a prediction score, not measured accuracy.
+
+```{python}
+validation_errors = validation_images.copy()
+validation_errors["predicted_label"] = validation_predicted
+validation_errors["model_probability"] = validation_probabilities.max(axis=1)
+validation_errors = validation_errors[
+    validation_errors["label"] != validation_errors["predicted_label"]
+].sort_values("model_probability", ascending=False)
+validation_errors.to_csv(OUTPUT_DIR / "validation_errors.csv", index=False)
+
+if validation_errors.empty:
+    print("No misclassified validation images.")
+else:
+    fig, axes = plt.subplots(2, 3, figsize=(11, 7))
+    for axis, (_, example) in zip(axes.flat, validation_errors.head(6).iterrows()):
+        image, _ = load_image(example["path"], 0)
+        axis.imshow(image.numpy())
+        axis.set_title(
+            f"Actual {example['class_name']}\n"
+            f"Predicted {class_names[int(example['predicted_label'])]} "
+            f"(p={example['model_probability']:.2f})"
+        )
+    for axis in axes.flat:
+        axis.axis("off")
+    plt.tight_layout()
+    plt.show()
+```
+
+## Review the learning curves
+
+Compare training and validation results when adjusting the model. A growing gap
+can indicate overfitting. These curves describe the base CNN; the validation
+table above reports the selected lighting recipe. Reserve the test set for
+evaluating the final model.
+
+```{python}
+epochs = range(1, len(history.history["loss"]) + 1)
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for axis, metric, title in zip(axes, ("accuracy", "loss"), ("Accuracy", "Loss")):
+    axis.plot(epochs, history.history[metric], label="Training")
+    axis.plot(epochs, history.history[f"val_{metric}"], label="Validation")
+    axis.set(xlabel="Epoch", ylabel=title, title=f"Training and validation {metric}")
+    axis.set_xticks(list(epochs))
+    axis.legend()
+plt.tight_layout()
+plt.show()
+```
+
+## Model evaluation
+
+**Johnny, Data Science Intern:**
+
+This seems like one of those cases where straight accuracy might not be the best metric for model evaluation, but what do you think?
+
+### Evaluate held-out images and draw the confusion matrix
+
+The guide's prediction and confusion-matrix workflow now uses the internal test
+set from both archives. Report per-class precision, recall, and F1 because the
+class sizes differ. Folder IDs are used as labels; the archives do not include
+a file mapping IDs to readable class names.
+
+We have inspected this test set during iterative development, so these
+comparisons are diagnostic. Use fresh labeled images for a final unbiased
+assessment of the completed model and preprocessing choices.
+
+```{python}
+y_true = test_images["label"].to_numpy()
+test_probabilities = predict_with_lighting(model, test_ds, inference_variants)
+y_pred = test_probabilities.argmax(axis=1)
+test_accuracy = accuracy_score(y_true, y_pred)
+test_loss = float(np.mean(tf.keras.losses.categorical_crossentropy(
+    to_categorical(y_true, num_classes=NUM_CLASSES), test_probabilities,
+)))
+print(f"Test loss: {test_loss:.4f}")
+print(f"Test accuracy: {test_accuracy:.2%}")
+test_luminance = np.concatenate([mean_luminance(batch).numpy() for batch, labels in test_ds])
+test_dark = test_luminance < DARK_LUMINANCE_THRESHOLD
+if test_dark.any():
+    print(f"Dark-image test accuracy: {accuracy_score(y_true[test_dark], y_pred[test_dark]):.2%}")
+
+# Report the old and selected lighting methods on this same final test set.
+previous_test_predicted = predict_with_lighting(model, test_ds, (1.0, 0.5)).argmax(axis=1)
+test_comparison_rows = []
+for name, predicted in (("Previous lighting", previous_test_predicted),
+                        (selected_recipe, y_pred)):
+    test_comparison_rows.append({
+        "recipe": name,
+        "test_accuracy": accuracy_score(y_true, predicted),
+        "test_macro_f1": f1_score(y_true, predicted, average="macro", zero_division=0),
+        "dark_test_accuracy": (
+            accuracy_score(y_true[test_dark], predicted[test_dark])
+            if test_dark.any() else np.nan
+        ),
+        "dark_test_images": int(test_dark.sum()),
+    })
+test_lighting_comparison = pd.DataFrame(test_comparison_rows)
+test_lighting_comparison.to_csv(OUTPUT_DIR / "test_lighting_comparison.csv", index=False)
+print(test_lighting_comparison.to_string(index=False))
+
+print(classification_report(
+    y_true, y_pred, labels=np.arange(NUM_CLASSES),
+    target_names=class_names, zero_division=0,
+))
+
+cm = confusion_matrix(
+    y_true,
+    y_pred,
+    labels=np.arange(NUM_CLASSES),
+    normalize="true",
+)
+
+plt.figure(figsize=(13, 11))
+sns.heatmap(
+    cm,
+    cmap="Blues",
+    vmin=0,
+    vmax=1,
+    xticklabels=class_names,
+    yticklabels=class_names,
+    cbar_kws={"label": "Fraction of images in the true class"},
+)
+plt.xlabel("Predicted class")
+plt.ylabel("Actual class")
+plt.title("Classification results by class")
+plt.tight_layout()
+plt.show()
+```
+
+## Save and reload the model
+
+Save in the Keras format along with the ordered class labels and selected
+lighting recipe. New images must use the same RGB conversion, resizing, and
+0–1 normalization as the training images. Use `predict_with_lighting` with the
+saved recipe to reproduce the final predictions; calling the Keras model alone
+gives the base CNN predictions. Re-running this section replaces the previous
+lighting-enhanced artifacts in `cnn_training_output/lighting_enhanced`.
+
+```{python}
+model_path = OUTPUT_DIR / "cnn_sign_model.keras"
+labels_path = OUTPUT_DIR / "class_names.json"
+inference_config_path = OUTPUT_DIR / "inference_config.json"
+model.save(model_path)
+labels_path.write_text(json.dumps(class_names, indent=2), encoding="utf-8")
+inference_config_path.write_text(
+    json.dumps({
+        "variants": list(inference_variants),
+        "contrast_percentiles": [1, 99],
+        "dark_luminance_threshold": DARK_LUMINANCE_THRESHOLD,
+    }, indent=2), encoding="utf-8",
+)
+
+loaded_model = models.load_model(model_path)
+loaded_class_names = json.loads(labels_path.read_text(encoding="utf-8"))
+loaded_inference_config = json.loads(
+    inference_config_path.read_text(encoding="utf-8")
+)
+# Also accept the earlier gamma-only configuration format.
+loaded_inference_variants = loaded_inference_config.get(
+    "variants", loaded_inference_config.get("gammas", [1.0])
+)
+example_image, _ = load_image(test_images.iloc[0]["path"], 0)
+probabilities = predict_with_lighting(
+    loaded_model, example_image[tf.newaxis, ...], loaded_inference_variants,
+)[0]
+predicted_class = loaded_class_names[int(np.argmax(probabilities))]
+print(f"Saved model: {model_path}")
+print(f"Example actual class: {test_images.iloc[0]['class_name']}")
+print(f"Example predicted class: {predicted_class}")
+```
+
+## Predict the separate holdout images
+
+`holdout.zip` contains 12,630 JPEG images in one folder, with no class labels.
+Use this separate dataset after choosing the final model with the internal
+validation set. It stays out of training and model selection. The numeric
+filenames are image identifiers, not class labels.
+
+Apply the same RGB conversion, resizing, and normalization as the training
+images. Read directly from the archive in batches, then save one prediction
+per image to `cnn_training_output/lighting_enhanced/holdout_predictions.csv`. Each prediction
+includes the numbered class folder and its model probability. Probabilities
+do not establish whether a prediction is correct.
+
+```{python}
+holdout_archive = NOTEBOOK_DIR / "holdout.zip"
+with ZipFile(holdout_archive) as archive:
+    holdout_members = sorted(
+        member.filename for member in archive.infolist()
+        if not member.is_dir()
+        and PurePosixPath(member.filename).suffix.lower() == ".jpg"
+    )
+if not holdout_members:
+    raise ValueError("No JPEG images found in holdout.zip.")
+
+def read_holdout_images():
+    with ZipFile(holdout_archive) as archive:
+        for name in holdout_members:
+            yield archive.read(name)
+
+holdout_ds = tf.data.Dataset.from_generator(
+    read_holdout_images,
+    output_signature=tf.TensorSpec(shape=(), dtype=tf.string),
+)
+holdout_ds = holdout_ds.apply(
+    tf.data.experimental.assert_cardinality(len(holdout_members))
+)
+holdout_ds = holdout_ds.map(
+    preprocess_holdout, num_parallel_calls=tf.data.AUTOTUNE
+).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+# Preserve filename order so every prediction matches the correct image.
+holdout_probabilities = predict_with_lighting(
+    loaded_model, holdout_ds, loaded_inference_variants,
+)
+holdout_class_indices = holdout_probabilities.argmax(axis=1)
+holdout_luminance = np.concatenate([
+    mean_luminance(batch).numpy() for batch in holdout_ds
+])
+holdout_predictions = pd.DataFrame({
+    "filename": [PurePosixPath(name).name for name in holdout_members],
+    "predicted_class": [loaded_class_names[index] for index in holdout_class_indices],
+    "model_probability": holdout_probabilities.max(axis=1),
+    "mean_luminance": holdout_luminance,
+    "is_dark": holdout_luminance < DARK_LUMINANCE_THRESHOLD,
+})
+holdout_csv = OUTPUT_DIR / "holdout_predictions.csv"
+holdout_predictions.to_csv(holdout_csv, index=False)
+holdout_classes_csv = OUTPUT_DIR / "holdout_classes.csv"
+holdout_predictions[["predicted_class"]].astype(int).to_csv(holdout_classes_csv, index=False)
+print(f"Saved {len(holdout_predictions):,} predictions to {holdout_csv}")
+print(f"Saved class-only predictions without leading zeros to {holdout_classes_csv}")
+holdout_predictions.head(10)
+```
+
+### Brighten the dark images that were unclear during visual review
+
+Mean luminance flags underexposed images. If the earlier visual review CSV is
+available, export brighter PNG previews for its dark, unclear examples. Without
+that review file, use the six least-confident dark holdout predictions instead.
+The preview CSV includes previous and updated predictions for comparison.
+
+The previews retain the original resolution; the CNN applies the same contrast
+procedure to its 32-by-32 inputs. Brightening does not establish a correct label:
+blur, glare, or missing details can still make the sign unreadable. Visual review
+labels remain separate from the labeled validation/test evaluation above.
+
+```{python}
+preview_rows = holdout_predictions[holdout_predictions["is_dark"]].copy()
+visual_review_path = BASELINE_DIR / "holdout_predictions_visual_review.csv"
+if visual_review_path.is_file():
+    reviewed_images = pd.read_csv(visual_review_path)
+    unclear_filenames = reviewed_images.loc[
+        reviewed_images["visual_review"] == "unclear", "filename"
+    ]
+    preview_rows = preview_rows[preview_rows["filename"].isin(unclear_filenames)]
+else:
+    preview_rows = preview_rows.nsmallest(6, "model_probability")
+preview_rows = preview_rows.sort_values("model_probability").reset_index(drop=True)
+
+previous_holdout_path = PREVIOUS_MODEL_DIR / "holdout_predictions.csv"
+if previous_holdout_path.is_file():
+    previous_holdout = pd.read_csv(previous_holdout_path, dtype={"predicted_class": str})
+    previous_holdout = previous_holdout[["filename", "predicted_class", "model_probability"]]
+    preview_rows = preview_rows.merge(
+        previous_holdout.rename(columns={
+            "predicted_class": "previous_predicted_class",
+            "model_probability": "previous_model_probability",
+        }), on="filename", how="left", validate="one_to_one",
+    )
+
+preview_dir = OUTPUT_DIR / "brightened_previews"
+preview_dir.mkdir(parents=True, exist_ok=True)
+members_by_filename = {PurePosixPath(name).name: name for name in holdout_members}
+preview_triplets = []
+with ZipFile(holdout_archive) as archive:
+    for index, example in preview_rows.iterrows():
+        original = tf.io.decode_jpeg(
+            archive.read(members_by_filename[example["filename"]]), channels=3,
+        )
+        original = tf.cast(original, tf.float32) / 255.0
+        triplet = (original, tf.image.adjust_gamma(original, 0.5), stretch_contrast(original))
+        for suffix, image in zip(("original", "gamma", "contrast"), triplet):
+            path = preview_dir / f"{Path(example['filename']).stem}_{suffix}.png"
+            pixels = tf.image.convert_image_dtype(image, tf.uint8, saturate=True)
+            tf.io.write_file(str(path), tf.io.encode_png(pixels))
+        if index < 6:
+            preview_triplets.append(triplet)
+preview_rows["contrast_preview"] = preview_rows["filename"].map(
+    lambda name: f"brightened_previews/{Path(name).stem}_contrast.png"
+)
+preview_rows.to_csv(OUTPUT_DIR / "dark_unclear_image_comparison.csv", index=False)
+print(f"Saved original, gamma, and contrast previews for {len(preview_rows)} dark images.")
+
+if preview_triplets:
+    fig, axes = plt.subplots(len(preview_triplets), 3,
+                             figsize=(10, 3 * len(preview_triplets)), squeeze=False)
+    for row, triplet in enumerate(preview_triplets):
+        for column, (title, image) in enumerate(zip(
+            ("Original", "Gamma 0.5", "Contrast stretch"), triplet,
+        )):
+            axes[row, column].imshow(image.numpy())
+            axes[row, column].set_title(f"{preview_rows.iloc[row]['filename']}: {title}")
+            axes[row, column].axis("off")
+    plt.tight_layout()
+    fig.savefig(OUTPUT_DIR / "dark_image_previews.png", dpi=150, bbox_inches="tight")
+    plt.show()
+preview_rows.head(10)
+```
+
+## Confidence and prediction review
+
+**Karl, Head of AI:**
+
+We'd like you to actually ride in the car for a test drive, based on automation built on your sign recognition model. What performance would you require before you’d ride in the car?
+
+Based on your initial analysis of the data, your team feels:
+
+a. Only an F1 score of 1.00 on all signs would be appropriate.
+b. A recall score of 1.00 for all stop signs.
+c. An accuracy of 95% would be good enough.
+d. An accuracy of 85% or above for all warning/information signs, and 98% or above for all other prohibition and traffic signs.
+
+The probabilities below are model output scores. Use the labeled evaluation and visual checks to assess prediction errors.
+
+### Inspect sample predictions
+
+These examples allow a visual review; they do not replace scoring against known
+labels. To calculate holdout accuracy, per-class recall, or a confusion matrix,
+we need a separate answer file mapping each filename to its actual class.
+Once available, match that file to predictions by filename before scoring.
+
+```{python}
+sample_indices = np.random.default_rng(SEED).choice(
+    len(holdout_members), size=min(6, len(holdout_members)), replace=False
+)
+fig, axes = plt.subplots(2, 3, figsize=(11, 7))
+with ZipFile(holdout_archive) as archive:
+    for axis, index in zip(axes.flat, sample_indices):
+        image = preprocess_holdout(archive.read(holdout_members[index]))
+        prediction = holdout_predictions.iloc[index]
+        axis.imshow(image.numpy())
+        axis.set_title(
+            f"{prediction['filename']}\n"
+            f"Class {prediction['predicted_class']} "
+            f"(p={prediction['model_probability']:.2f})"
+        )
+for axis in axes.flat:
+    axis.axis("off")
+plt.tight_layout()
+plt.show()
+```
+
+### Check the two manually reviewed holdout examples
+
+The following labels were supplied during visual review: `01280.jpg` belongs
+to class `00002`, and `01307.jpg` belongs to class `00019`. This small check
+tracks those specific mistakes after retraining. It is not an estimate of
+overall holdout accuracy. Model selection above uses the labeled validation
+set; these images are not added to the training set.
+
+```{python}
+reviewed_labels = pd.DataFrame({
+    "filename": ["01280.jpg", "01307.jpg"],
+    "actual_class": ["00002", "00019"],
+})
+reviewed_results = reviewed_labels.merge(
+    holdout_predictions, on="filename", how="left", validate="one_to_one",
+)
+if reviewed_results["predicted_class"].isna().any():
+    raise ValueError("A reviewed image is missing from the holdout predictions.")
+reviewed_results["correct"] = (
+    reviewed_results["actual_class"] == reviewed_results["predicted_class"]
+)
+previous_predictions_path = BASELINE_DIR / "holdout_predictions.csv"
+if previous_predictions_path.is_file():
+    previous_predictions = pd.read_csv(
+        previous_predictions_path, dtype={"predicted_class": str},
+    )[["filename", "predicted_class"]].rename(
+        columns={"predicted_class": "previous_predicted_class"}
+    )
+    reviewed_results = reviewed_results.merge(
+        previous_predictions, on="filename", how="left", validate="one_to_one",
+    )
+reviewed_results.to_csv(OUTPUT_DIR / "reviewed_holdout_checks.csv", index=False)
+print(reviewed_results.to_string(index=False))
+
+members_by_filename = {PurePosixPath(name).name: name for name in holdout_members}
+fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+with ZipFile(holdout_archive) as archive:
+    for axis, (_, example) in zip(axes, reviewed_results.iterrows()):
+        image = preprocess_holdout(archive.read(members_by_filename[example["filename"]]))
+        axis.imshow(image.numpy())
+        axis.set_title(
+            f"{example['filename']}\nActual {example['actual_class']}; "
+            f"predicted {example['predicted_class']}"
+        )
+        axis.axis("off")
+plt.tight_layout()
+fig.savefig(OUTPUT_DIR / "reviewed_holdout_examples.png", dpi=160, bbox_inches="tight")
+plt.show()
+```
+
+### Questions from stakeholders
+# Transfer learning for from scratch
+Karl, Head of AI
+Obviously you'll be using a convolutional neural network to build your model, but will you be using an existing architecture as a starting point, or do you think it'll be better to design your own?
+
+Based on your initial analysis of the data, your team feels:
+
+a. VGG-16 would be a good architecture to use on this data.
+b. ResNet would be a good architecture to use on this data.
+c. Inception would be a good architecture to use on this data.
+d. For best results, we should design a custom architecture.
